@@ -1,184 +1,370 @@
-name: A Munch New Kernel Driver Builder
+
+name: Build fgetpriority Kernel Module
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_url:
+        description: Kernel source repository
+        required: true
+        default: https://github.com/NKRLabs/kernel_xiaomi_sm8250_mod
+
+      kernel_ref:
+        description: Kernel branch or tag
+        required: true
+        default: android15-lineage22-mod
+
+      defconfig:
+        description: Target device defconfig
+        required: true
+        default: munch_defconfig
+
+      kernel_localversion:
+        description: Exact LOCALVERSION suffix (empty = build.sh convention)
+        required: false
+        default: ""
+
+      upload_release:
+        description: Upload to GitHub Release
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
 
 permissions:
   contents: write
 
-on: 
-  workflow_dispatch:
-    inputs:
-      kernel_url:
-        description: "Kernel Source Git URL"
-        required: true
-        default: "https://github.com/NKRLabs/kernel_xiaomi_sm8250_mod"
-      kernel_ref:
-        description: "Branch / tag / commit (optional)"
-        required: false
-        default: ""
-      defconfig:
-        description: "Defconfig name (e.g. munch_defconfig)"
-        required: true
-        default: "munch_defconfig"
-      disable_modversions:
-        description: "Disable MODVERSIONS (and related options) via scripts/config"
-        required: false
-        default: false
-        type: boolean
-      upload_release:
-        description: "Upload zip to GitHub Release?"
-        required: true
-        default: "true"
-        type: choice
-        options:
-          - "false"
-          - "true"
-
 jobs:
   build:
-    runs-on: ubuntu-latest
-    
+    name: Build ARM64 LKM
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Install tools
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y gcc-aarch64-linux-gnu libelf-dev bc bison flex libssl-dev zip kmod jq
-    
-    - name: Download kernelsrc
-      run: |
-        set -euxo pipefail
-        rm -rf kernelsrc
+      - name: Checkout fgetpriority
+        uses: actions/checkout@v4
+        with:
+          path: fgetpriority
 
-        KERNEL_URL="${{ inputs.kernel_url }}"
-        KERNEL_REF="${{ inputs.kernel_ref }}"
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
 
-        echo "Requested kernel_url: $KERNEL_URL"
-        echo "Requested kernel_ref: '$KERNEL_REF'"
+          sudo apt-get install -y \
+            build-essential \
+            git \
+            wget \
+            unzip \
+            zip \
+            bc \
+            bison \
+            flex \
+            cpio \
+            rsync \
+            python-is-python3 \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabi \
+            kmod
 
-        if [ -z "$KERNEL_REF" ]; then
-          git clone --depth=1 --recurse-submodules --shallow-submodules "$KERNEL_URL" kernelsrc
+      - name: Download Proton Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/proton-clang"
+
+          wget -q \
+            https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip \
+            -O "$HOME/proton-clang/compiler.zip"
+
+          unzip -q \
+            "$HOME/proton-clang/compiler.zip" \
+            -d "$HOME/proton-clang"
+
+          TOOLCHAIN="$HOME/proton-clang/proton-clang-20210522"
+
+          test -x "$TOOLCHAIN/bin/clang"
+
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
+
+          echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+
+          clang --version || "$TOOLCHAIN/bin/clang" --version
+
+      - name: Clone kernel source
+        shell: bash
+        env:
+          KERNEL_URL: ${{ inputs.kernel_url }}
+          KERNEL_REF: ${{ inputs.kernel_ref }}
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --depth=1 \
+            --branch "$KERNEL_REF" \
+            "$KERNEL_URL" \
+            kernelsrc
+
           cd kernelsrc
-        else
-          if git ls-remote --heads --tags "$KERNEL_URL" "$KERNEL_REF" | grep -q .; then
-            git clone --depth=1 --branch "$KERNEL_REF" "$KERNEL_URL" kernelsrc
-            cd kernelsrc
+
+          echo "Kernel branch: $KERNEL_REF"
+          echo "Kernel commit: $(git rev-parse HEAD)"
+
+          echo "KERNEL_COMMIT=$(git rev-parse --short=8 HEAD)" \
+            >> "$GITHUB_ENV"
+
+      - name: Configure kernel
+        shell: bash
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+          REQUESTED_LOCALVERSION: ${{ inputs.kernel_localversion }}
+        run: |
+          set -euo pipefail
+
+          cd kernelsrc
+
+          DEFCONFIG="$(basename "$DEFCONFIG")"
+
+          if [[ ! -f "arch/arm64/configs/$DEFCONFIG" ]]; then
+            echo "ERROR: Defconfig not found: $DEFCONFIG"
+            exit 1
+          fi
+
+          MAKE_ARGS=(
+            ARCH=arm64
+            SUBARCH=arm64
+            O=out
+            CC=clang
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            CLANG_TRIPLE=aarch64-linux-gnu-
+          )
+
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+          # Match the kernel repository's build.sh localversion convention.
+          if [[ -n "$REQUESTED_LOCALVERSION" ]]; then
+            LOCALVERSION="$REQUESTED_LOCALVERSION"
           else
-            git clone "$KERNEL_URL" kernelsrc
-            cd kernelsrc
-            git checkout "$KERNEL_REF"
+            LOCALVERSION="-$(date +%Y%m%d)-${KERNEL_COMMIT}-perf"
           fi
-        fi
 
-        echo "Kernel branch: $(git branch --show-current || echo '(detached or unknown)')"
-        echo "Kernel commit: $(git rev-parse --short HEAD || echo 'unknown')"
+          ./scripts/config \
+            --file out/.config \
+            --set-str LOCALVERSION "$LOCALVERSION" \
+            --disable LOCALVERSION_AUTO
 
-    - name: Configure kernelsrc
-      run: |
-        set -euxo pipefail
-        cd kernelsrc
+          make "${MAKE_ARGS[@]}" olddefconfig
 
-        DEFCONFIG_INPUT="${{ inputs.defconfig }}"
-        DEFCONFIG_NAME="$(basename "$DEFCONFIG_INPUT")"
-        test -f "arch/arm64/configs/$DEFCONFIG_NAME"
+          # Verify module support.
+          grep -q '^CONFIG_MODULES=y$' out/.config
 
-        ./scripts/config --set-str LOCALVERSION "4.19.325-perf+" -d LOCALVERSION_AUTO
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- "$DEFCONFIG_NAME"
+          grep -q '^CONFIG_MODVERSIONS=y$' out/.config
 
-        ./scripts/config --enable  CONFIG_KPROBES
-        ./scripts/config --enable  CONFIG_KRETPROBES
+          echo "Kernel LOCALVERSION: $LOCALVERSION"
 
-        if [[ "${{ inputs.disable_modversions }}" == "true" ]]; then
-          ./scripts/config --disable CONFIG_MODVERSIONS
-          ./scripts/config --disable CONFIG_ASM_MODVERSIONS
-          ./scripts/config --disable CONFIG_MODULE_SRCVERSION_ALL
-        fi
+          echo "MAKE_ARGS=${MAKE_ARGS[*]}" >> "$GITHUB_ENV"
 
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc)
-    
-    - name: Build module
-      run: |
-        KERNEL_DIR=$(pwd)/kernelsrc
-        MODULE_SRC=$(pwd)/kernel
-        
-        cd "$KERNEL_DIR"
-        make -C "$KERNEL_DIR" M="$MODULE_SRC" \
-          ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-          modules -j$(nproc)
-        
-        aarch64-linux-gnu-strip --strip-debug "$MODULE_SRC"/*.ko
-    
-    - name: Verify build
-      run: |
-        echo "=== Module info ==="
-        modinfo kernel/*.ko
-        echo ""
-        echo "✅ SUCCESS: Module compiled!"
+      - name: Build kernel and generate Module.symvers
+        shell: bash
+        run: |
+          set -euo pipefail
 
-    - name: Package kernel module (zip named from vermagic)
-      id: package
-      shell: bash
-      run: |
-        set -euxo pipefail
-        shopt -s nullglob
-        KOS=(kernel/*.ko)
-        if [ ${#KOS[@]} -eq 0 ]; then
-          echo "No .ko built, skipping packaging."
-          echo "found=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
+          cd kernelsrc
 
-        KO="${KOS[0]}"
-        VERMAGIC="$(modinfo -F vermagic "$KO" | tr -d '\n')"
-        echo "vermagic: $VERMAGIC"
+          MAKE_ARGS=(
+            ARCH=arm64
+            SUBARCH=arm64
+            O=out
+            CC=clang
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            CLANG_TRIPLE=aarch64-linux-gnu-
+          )
 
-        KREL="$(echo "$VERMAGIC" | awk '{print $1}')"
-        MODNAME="fgetpriority"
-        ZIPNAME="${KREL}-${MODNAME}-kernel-driver.zip"
+          # Full kernel build is necessary for MODVERSIONS.
+          make "${MAKE_ARGS[@]}" \
+            -j"$(nproc)" \
+            Image dtbs modules
 
-        mkdir -p dist
-        rm -f "dist/$ZIPNAME"
-        (cd kernel && zip -9 "../dist/$ZIPNAME" ./*.ko)
-
-        echo "found=true" >> "$GITHUB_OUTPUT"
-        echo "tag_name=$KREL" >> "$GITHUB_OUTPUT"
-        echo "zipname=$ZIPNAME" >> "$GITHUB_OUTPUT"
-        echo "zippath=dist/$ZIPNAME" >> "$GITHUB_OUTPUT"
-
-    - name: Upload .ko as artifact
-      if: steps.package.outputs.found == 'true'
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernel-driver
-        path: kernel/*.ko
-
-    - name: Generate release notes (modinfo)
-      if: steps.package.outputs.found == 'true'
-      shell: bash
-      run: |
-        set -euxo pipefail
-        mkdir -p dist
-        {
-          echo "### Build sources"
-          echo ""
-          echo "- Kernel source URL: ${{ inputs.kernel_url }}"
-          if [[ -n "${{ inputs.kernel_ref }}" ]]; then
-            echo "- Kernel ref: ${{ inputs.kernel_ref }}"
+          # modules_prepare alone does not generate this file.
+          if [[ ! -s out/Module.symvers ]]; then
+            echo "ERROR: Module.symvers was not generated!"
+            exit 1
           fi
-          echo ""
-          echo "### Module info"
-          echo ""
-          echo '```'
-          modinfo kernel/*.ko
-          echo '```'
-        } > dist/release_notes.md
 
-    - name: Upload zip to GitHub Release (tag from vermagic)
-      if: steps.package.outputs.found == 'true' && inputs.upload_release == 'true'
-      continue-on-error: true
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ steps.package.outputs.tag_name }}
-        name: ${{ steps.package.outputs.tag_name }}
-        files: ${{ steps.package.outputs.zippath }}
-        body_path: dist/release_notes.md
+          echo "Module.symvers generated:"
+          ls -lh out/Module.symvers
+
+      - name: Build external fgetpriority module
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KERNEL_DIR="$GITHUB_WORKSPACE/kernelsrc"
+          MODULE_SRC="$GITHUB_WORKSPACE/fgetpriority/kernel"
+          OUT_DIR="$KERNEL_DIR/out"
+
+          cd "$KERNEL_DIR"
+
+          MAKE_ARGS=(
+            ARCH=arm64
+            SUBARCH=arm64
+            O=out
+            CC=clang
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            CLANG_TRIPLE=aarch64-linux-gnu-
+          )
+
+          # Explicitly build the external module.
+          make "${MAKE_ARGS[@]}" \
+            M="$MODULE_SRC" \
+            CONFIG_FGETPRIORITY=m \
+            modules -j"$(nproc)"
+
+          shopt -s nullglob
+
+          KOS=("$MODULE_SRC"/*.ko)
+
+          if [[ ${#KOS[@]} -eq 0 ]]; then
+            echo "ERROR: No .ko file was generated!"
+            exit 1
+          fi
+
+          aarch64-linux-gnu-strip --strip-debug "${KOS[@]}"
+
+          echo "Generated modules:"
+          ls -lh "${KOS[@]}"
+
+      - name: Verify kernel module
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KO="$GITHUB_WORKSPACE/fgetpriority/kernel/fgetpriority.ko"
+
+          if [[ ! -s "$KO" ]]; then
+            echo "ERROR: fgetpriority.ko does not exist!"
+            exit 1
+          fi
+
+          echo "=== ELF information ==="
+          file "$KO"
+
+          echo ""
+          echo "=== Module information ==="
+          modinfo "$KO"
+
+          VERMAGIC="$(modinfo -F vermagic "$KO")"
+          KREL="${VERMAGIC%% *}"
+
+          echo ""
+          echo "Kernel release: $KREL"
+          echo "Vermagic: $VERMAGIC"
+
+          if [[ -z "$VERMAGIC" ]]; then
+            echo "ERROR: Missing vermagic!"
+            exit 1
+          fi
+
+          echo "KREL=$KREL" >> "$GITHUB_OUTPUT"
+          echo "VERMAGIC=$VERMAGIC" >> "$GITHUB_OUTPUT"
+
+      - name: Package module
+        id: package
+        shell: bash
+        env:
+          KREL: ${{ steps.verify.outputs.KREL }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          KO="$GITHUB_WORKSPACE/fgetpriority/kernel/fgetpriority.ko"
+
+          ZIPNAME="${KREL}-fgetpriority-kernel-module.zip"
+
+          zip -9 -j "dist/$ZIPNAME" "$KO"
+
+          cp "$KO" dist/
+
+          cat > dist/build-info.txt <<EOF
+          Module: fgetpriority
+          Architecture: arm64
+          Kernel release: $KREL
+          Kernel repository: ${{ inputs.kernel_url }}
+          Kernel branch: ${{ inputs.kernel_ref }}
+          Kernel commit: $KERNEL_COMMIT
+          Defconfig: ${{ inputs.defconfig }}
+          Compiler: Proton Clang 20210522
+          EOF
+
+          echo "zipname=$ZIPNAME" >> "$GITHUB_OUTPUT"
+
+          echo "=== Package contents ==="
+          ls -lh dist/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fgetpriority-${{ steps.verify.outputs.KREL }}
+          path: |
+            dist/*.ko
+            dist/*.zip
+            dist/build-info.txt
+          if-no-files-found: error
+          compression-level: 9
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          KREL: ${{ steps.verify.outputs.KREL }}
+          VERMAGIC: ${{ steps.verify.outputs.VERMAGIC }}
+        run: |
+          set -euo pipefail
+
+          cat > dist/release_notes.md <<EOF
+          ## fgetpriority Kernel Module
+
+          - Architecture: ARM64
+          - Kernel release: $KREL
+          - Vermagic: $VERMAGIC
+          - Kernel branch: ${{ inputs.kernel_ref }}
+          - Kernel commit: $KERNEL_COMMIT
+          - Defconfig: ${{ inputs.defconfig }}
+          - Compiler: Proton Clang 20210522
+
+          ### Files
+
+          - fgetpriority.ko
+          - ${{ steps.package.outputs.zipname }}
+
+          Build generated against the specified kernel source and defconfig.
+          EOF
+
+      - name: Publish GitHub Release
+        if: inputs.upload_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.verify.outputs.KREL }}
+          name: fgetpriority - ${{ steps.verify.outputs.KREL }}
+          body_path: dist/release_notes.md
+          files: |
+            dist/fgetpriority.ko
+            dist/${{ steps.package.outputs.zipname }}
+            dist/build-info.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
