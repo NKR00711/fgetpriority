@@ -1,0 +1,184 @@
+name: A Munch New Kernel Driver Builder
+
+permissions:
+  contents: write
+
+on: 
+  workflow_dispatch:
+    inputs:
+      kernel_url:
+        description: "Kernel Source Git URL"
+        required: true
+        default: "https://github.com/NKRLabs/kernel_xiaomi_sm8250_mod"
+      kernel_ref:
+        description: "Branch / tag / commit (optional)"
+        required: false
+        default: ""
+      defconfig:
+        description: "Defconfig name (e.g. munch_defconfig)"
+        required: true
+        default: "munch_defconfig"
+      disable_modversions:
+        description: "Disable MODVERSIONS (and related options) via scripts/config"
+        required: false
+        default: false
+        type: boolean
+      upload_release:
+        description: "Upload zip to GitHub Release?"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-aarch64-linux-gnu libelf-dev bc bison flex libssl-dev zip kmod jq
+    
+    - name: Download kernelsrc
+      run: |
+        set -euxo pipefail
+        rm -rf kernelsrc
+
+        KERNEL_URL="${{ inputs.kernel_url }}"
+        KERNEL_REF="${{ inputs.kernel_ref }}"
+
+        echo "Requested kernel_url: $KERNEL_URL"
+        echo "Requested kernel_ref: '$KERNEL_REF'"
+
+        if [ -z "$KERNEL_REF" ]; then
+          git clone --depth=1 --recurse-submodules --shallow-submodules "$KERNEL_URL" kernelsrc
+          cd kernelsrc
+        else
+          if git ls-remote --heads --tags "$KERNEL_URL" "$KERNEL_REF" | grep -q .; then
+            git clone --depth=1 --branch "$KERNEL_REF" "$KERNEL_URL" kernelsrc
+            cd kernelsrc
+          else
+            git clone "$KERNEL_URL" kernelsrc
+            cd kernelsrc
+            git checkout "$KERNEL_REF"
+          fi
+        fi
+
+        echo "Kernel branch: $(git branch --show-current || echo '(detached or unknown)')"
+        echo "Kernel commit: $(git rev-parse --short HEAD || echo 'unknown')"
+
+    - name: Configure kernelsrc
+      run: |
+        set -euxo pipefail
+        cd kernelsrc
+
+        DEFCONFIG_INPUT="${{ inputs.defconfig }}"
+        DEFCONFIG_NAME="$(basename "$DEFCONFIG_INPUT")"
+        test -f "arch/arm64/configs/$DEFCONFIG_NAME"
+
+        ./scripts/config --set-str LOCALVERSION "4.19.325-perf+" -d LOCALVERSION_AUTO
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- "$DEFCONFIG_NAME"
+
+        ./scripts/config --enable  CONFIG_KPROBES
+        ./scripts/config --enable  CONFIG_KRETPROBES
+
+        if [[ "${{ inputs.disable_modversions }}" == "true" ]]; then
+          ./scripts/config --disable CONFIG_MODVERSIONS
+          ./scripts/config --disable CONFIG_ASM_MODVERSIONS
+          ./scripts/config --disable CONFIG_MODULE_SRCVERSION_ALL
+        fi
+
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc)
+    
+    - name: Build module
+      run: |
+        KERNEL_DIR=$(pwd)/kernelsrc
+        MODULE_SRC=$(pwd)/kernel
+        
+        cd "$KERNEL_DIR"
+        make -C "$KERNEL_DIR" M="$MODULE_SRC" \
+          ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+          modules -j$(nproc)
+        
+        aarch64-linux-gnu-strip --strip-debug "$MODULE_SRC"/*.ko
+    
+    - name: Verify build
+      run: |
+        echo "=== Module info ==="
+        modinfo kernel/*.ko
+        echo ""
+        echo "✅ SUCCESS: Module compiled!"
+
+    - name: Package kernel module (zip named from vermagic)
+      id: package
+      shell: bash
+      run: |
+        set -euxo pipefail
+        shopt -s nullglob
+        KOS=(kernel/*.ko)
+        if [ ${#KOS[@]} -eq 0 ]; then
+          echo "No .ko built, skipping packaging."
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        KO="${KOS[0]}"
+        VERMAGIC="$(modinfo -F vermagic "$KO" | tr -d '\n')"
+        echo "vermagic: $VERMAGIC"
+
+        KREL="$(echo "$VERMAGIC" | awk '{print $1}')"
+        MODNAME="fgetpriority"
+        ZIPNAME="${KREL}-${MODNAME}-kernel-driver.zip"
+
+        mkdir -p dist
+        rm -f "dist/$ZIPNAME"
+        (cd kernel && zip -9 "../dist/$ZIPNAME" ./*.ko)
+
+        echo "found=true" >> "$GITHUB_OUTPUT"
+        echo "tag_name=$KREL" >> "$GITHUB_OUTPUT"
+        echo "zipname=$ZIPNAME" >> "$GITHUB_OUTPUT"
+        echo "zippath=dist/$ZIPNAME" >> "$GITHUB_OUTPUT"
+
+    - name: Upload .ko as artifact
+      if: steps.package.outputs.found == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-driver
+        path: kernel/*.ko
+
+    - name: Generate release notes (modinfo)
+      if: steps.package.outputs.found == 'true'
+      shell: bash
+      run: |
+        set -euxo pipefail
+        mkdir -p dist
+        {
+          echo "### Build sources"
+          echo ""
+          echo "- Kernel source URL: ${{ inputs.kernel_url }}"
+          if [[ -n "${{ inputs.kernel_ref }}" ]]; then
+            echo "- Kernel ref: ${{ inputs.kernel_ref }}"
+          fi
+          echo ""
+          echo "### Module info"
+          echo ""
+          echo '```'
+          modinfo kernel/*.ko
+          echo '```'
+        } > dist/release_notes.md
+
+    - name: Upload zip to GitHub Release (tag from vermagic)
+      if: steps.package.outputs.found == 'true' && inputs.upload_release == 'true'
+      continue-on-error: true
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.package.outputs.tag_name }}
+        name: ${{ steps.package.outputs.tag_name }}
+        files: ${{ steps.package.outputs.zippath }}
+        body_path: dist/release_notes.md
