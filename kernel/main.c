@@ -27,7 +27,6 @@ static_assert(1 == 0, "ARM64 only!");
 
 static uintptr_t native_sct = 0x0;
 static uintptr_t compat_sct = 0x0;
-static uintptr_t aarch64_acct = 0x0;
 
 static bool compat_hook_enabled = true;
 
